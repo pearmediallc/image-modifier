@@ -21,17 +21,60 @@ from pillow_heif import register_heif_opener
 import boto3
 from botocore.exceptions import ClientError
 
-# Update Redis connection to use environment variables
-redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
-redis_client = redis.from_url(redis_url, decode_responses=True)
+# Update Redis connection to use environment variables with fallback and error handling
+def get_redis_client():
+    try:
+        redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+        client = redis.from_url(redis_url, decode_responses=True)
+        # Test connection
+        client.ping()
+        app.logger.info("Successfully connected to Redis")
+        return client
+    except redis.ConnectionError:
+        app.logger.warning("Could not connect to Redis, falling back to in-memory storage")
+        return None
+    except Exception as e:
+        app.logger.error(f"Redis error: {str(e)}")
+        return None
+
+# Initialize Redis client
+redis_client = get_redis_client()
+
+# Add fallback for when Redis is not available
+class FallbackStorage:
+    def __init__(self):
+        self.storage = {}
+    
+    def hset(self, key, field, value):
+        if key not in self.storage:
+            self.storage[key] = {}
+        self.storage[key][field] = value
+        return 1
+    
+    def hget(self, key, field):
+        return self.storage.get(key, {}).get(field)
+    
+    def hincrby(self, key, field, amount=1):
+        if key not in self.storage:
+            self.storage[key] = {}
+        if field not in self.storage[key]:
+            self.storage[key][field] = 0
+        self.storage[key][field] += amount
+        return self.storage[key][field]
+    
+    def hgetall(self, key):
+        return self.storage.get(key, {})
+
+# Use Redis if available, otherwise use fallback
+storage = redis_client if redis_client else FallbackStorage()
 
 # Register HEIF opener
 register_heif_opener()
 
 # Flask app setup
 app = Flask(__name__)
-UPLOAD_FOLDER = 'uploads'
-OUTPUT_FOLDER = 'outputs'
+UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads')
+OUTPUT_FOLDER = os.getenv('OUTPUT_FOLDER', 'outputs')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 app.secret_key = 'f8cl2k98cj3i4fnckac3'
@@ -56,15 +99,21 @@ except redis.ConnectionError:
     app.logger.error("Failed to connect to Redis server")
     raise
 
-# After your UPLOAD_FOLDER and OUTPUT_FOLDER definitions
+# Ensure folders exist with proper permissions
 try:
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    app.logger.info(f"Upload folder: {os.path.abspath(UPLOAD_FOLDER)}")
-    app.logger.info(f"Output folder: {os.path.abspath(OUTPUT_FOLDER)}")
+    # Test write permissions
+    test_file = os.path.join(UPLOAD_FOLDER, '.test')
+    with open(test_file, 'w') as f:
+        f.write('test')
+    os.remove(test_file)
 except Exception as e:
-    app.logger.error(f"Failed to create required directories: {str(e)}")
-    raise
+    app.logger.error(f"Failed to initialize folders: {str(e)}")
+    # Use temporary directory as fallback
+    UPLOAD_FOLDER = tempfile.mkdtemp()
+    OUTPUT_FOLDER = tempfile.mkdtemp()
+    app.logger.info(f"Using temporary folders: {UPLOAD_FOLDER}, {OUTPUT_FOLDER}")
 
 # S3 client setup
 s3_client = boto3.client(
@@ -147,8 +196,8 @@ def upload_files():
         app.logger.info(f"Created temp folders - Upload: {session_upload_folder}, Output: {session_output_folder}")
 
         # Save folder paths in Redis
-        redis_client.hset(f"job:{job_id}", "upload_folder", session_upload_folder)
-        redis_client.hset(f"job:{job_id}", "output_folder", session_output_folder)
+        storage.hset(f"job:{job_id}", "upload_folder", session_upload_folder)
+        storage.hset(f"job:{job_id}", "output_folder", session_output_folder)
 
         if 'files[]' not in request.files:
             app.logger.error("No files found in request")
@@ -168,10 +217,10 @@ def upload_files():
 
         # Store job data in Redis
         total_files = len(files) * variations
-        redis_client.hset(f"job:{job_id}", "total_files", total_files)
-        redis_client.hset(f"job:{job_id}", "completed_files", 0)
-        redis_client.hset(f"job:{job_id}", "status", "pending")
-        redis_client.hset(f"job:{job_id}", "progress", 0)
+        storage.hset(f"job:{job_id}", "total_files", total_files)
+        storage.hset(f"job:{job_id}", "completed_files", 0)
+        storage.hset(f"job:{job_id}", "status", "pending")
+        storage.hset(f"job:{job_id}", "progress", 0)
 
         # Process each file
         for file in files:
@@ -211,7 +260,7 @@ def upload_files():
 @app.route('/progress/<job_id>', methods=['GET'])
 def get_progress(job_id):
 
-    job_data = redis_client.hgetall(f"job:{job_id}")
+    job_data = storage.hgetall(f"job:{job_id}")
 
     if not job_data:
         app.logger.error(f"[PROGRESS] Job ID {job_id} not found.")
@@ -224,7 +273,7 @@ def get_progress(job_id):
 
 @app.route('/download/<job_id>', methods=['GET'])
 def download_files(job_id):
-    job_data = redis_client.hgetall(f"job:{job_id}")
+    job_data = storage.hgetall(f"job:{job_id}")
     if not job_data:
         app.logger.error(f"[DOWNLOAD] Job ID {job_id} not found.")
         return jsonify({"error": "Invalid job ID"}), 404
@@ -306,17 +355,17 @@ def add_invisible_mesh(image):
 
 def update_job_progress(job_id):
     try:
-        completed_files = int(redis_client.hget(f"job:{job_id}", "completed_files") or 0)
-        total_files = int(redis_client.hget(f"job:{job_id}", "total_files") or 1)
+        completed_files = int(storage.hget(f"job:{job_id}", "completed_files") or 0)
+        total_files = int(storage.hget(f"job:{job_id}", "total_files") or 1)
         
         progress = int((completed_files / total_files) * 100)
         app.logger.info(f"Job {job_id}: Progress {progress}% ({completed_files}/{total_files} files)")
         
-        redis_client.hset(f"job:{job_id}", "progress", progress)
+        storage.hset(f"job:{job_id}", "progress", progress)
 
         if completed_files >= total_files:
             app.logger.info(f"Job {job_id} completed")
-            redis_client.hset(f"job:{job_id}", "status", "completed")
+            storage.hset(f"job:{job_id}", "status", "completed")
     except Exception as e:
         app.logger.error(f"Error updating progress for job {job_id}: {str(e)}", exc_info=True)
 
@@ -326,7 +375,7 @@ def update_job_progress(job_id):
 def modify_image(input_path, output_path, job_id, variation):
     try:
         app.logger.info(f"Starting image modification for job {job_id}, variation {variation}")
-        redis_client.hset(f"job:{job_id}", "status", "processing")
+        storage.hset(f"job:{job_id}", "status", "processing")
         
         image = Image.open(input_path)
         app.logger.info(f"Image opened successfully: {input_path}")
@@ -352,12 +401,12 @@ def modify_image(input_path, output_path, job_id, variation):
         modified_image.save(output_path, format="PNG")
         app.logger.info(f"Successfully saved modified image: {output_path}")
 
-        redis_client.hincrby(f"job:{job_id}", "completed_files", 1)
+        storage.hincrby(f"job:{job_id}", "completed_files", 1)
         update_job_progress(job_id)
 
     except Exception as e:
         app.logger.error(f"Error in image modification for job {job_id}: {str(e)}", exc_info=True)
-        redis_client.hset(f"job:{job_id}", "status", f"error: {str(e)}")
+        storage.hset(f"job:{job_id}", "status", f"error: {str(e)}")
 
 
 # Function to modify videos
@@ -367,7 +416,7 @@ def modify_video(input_path, output_path, job_id, variation):
         temp_audio_path = os.path.join(OUTPUT_FOLDER, f"{job_id}_{variation}_{os.path.basename(input_path)}_temp_audio.mp3")
         temp_video_path = os.path.join(OUTPUT_FOLDER, f"{job_id}_{variation}_{os.path.basename(input_path)}_temp_video.mp4")
 
-        redis_client.hset(f"job:{job_id}", "status", "processing")
+        storage.hset(f"job:{job_id}", "status", "processing")
 
         # Extract audio
         audio_extraction_command = [
@@ -421,7 +470,7 @@ def modify_video(input_path, output_path, job_id, variation):
             # Update progress periodically
             if total_frames > 0:
                 progress = int((processed_frames / total_frames) * 100)
-                redis_client.hset(f"job:{job_id}", "progress", progress)
+                storage.hset(f"job:{job_id}", "progress", progress)
 
         cap.release()
         out.release()
@@ -440,5 +489,5 @@ def modify_video(input_path, output_path, job_id, variation):
         # Cleanup and progress update
         safe_remove(temp_audio_path)
         safe_remove(temp_video_path)
-        redis_client.hincrby(f"job:{job_id}", "completed_files", 1)
+        storage.hincrby(f"job:{job_id}", "completed_files", 1)
         update_job_progress(job_id)
