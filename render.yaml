@@ -7,9 +7,14 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.0
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: redis-server
+          property: connectionString
     plan: free
 
   - type: redis
     name: redis-server
-    ipAllowList: []
-    plan: free 
+    ipAllowList: [] # optional (accepts all)
+    plan: free
