@@ -10,7 +10,7 @@ import zipfile
 import io
 import uuid
 import tempfile
-import shutil  # For directory cleanup
+import shutil
 import time
 import logging
 import threading
@@ -18,8 +18,16 @@ from threading import Lock
 from logging.handlers import RotatingFileHandler
 import redis
 from pillow_heif import register_heif_opener
-import boto3
-from botocore.exceptions import ClientError
+
+# Initialize Flask app first
+app = Flask(__name__)
+app.secret_key = 'f8cl2k98cj3i4fnckac3'
+
+# Set up Flask logger
+if not app.debug:
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    app.logger.handlers = gunicorn_logger.handlers
+    app.logger.setLevel(gunicorn_logger.level)
 
 # Update Redis connection to use environment variables with fallback and error handling
 def get_redis_client():
@@ -36,9 +44,6 @@ def get_redis_client():
     except Exception as e:
         app.logger.error(f"Redis error: {str(e)}")
         return None
-
-# Initialize Redis client
-redis_client = get_redis_client()
 
 # Add fallback for when Redis is not available
 class FallbackStorage:
@@ -65,39 +70,16 @@ class FallbackStorage:
     def hgetall(self, key):
         return self.storage.get(key, {})
 
-# Use Redis if available, otherwise use fallback
+# Initialize Redis client and storage
+redis_client = get_redis_client()
 storage = redis_client if redis_client else FallbackStorage()
 
 # Register HEIF opener
 register_heif_opener()
 
-# Flask app setup
-app = Flask(__name__)
+# Configure folders
 UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads')
 OUTPUT_FOLDER = os.getenv('OUTPUT_FOLDER', 'outputs')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-app.secret_key = 'f8cl2k98cj3i4fnckac3'
-
-job_status = {}
-job_folders = {}  # Tracks job_id -> session output folder mapping
-
-# Set up Flask logger
-if not app.debug:
-    gunicorn_logger = logging.getLogger("gunicorn.error")
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
-
-# Update FFmpeg path for Render.com
-FFMPEG_PATH = os.getenv('FFMPEG_PATH', '/usr/bin/ffmpeg')
-
-# At the start of your app, after Redis client initialization
-try:
-    redis_client.ping()
-    app.logger.info("Successfully connected to Redis")
-except redis.ConnectionError:
-    app.logger.error("Failed to connect to Redis server")
-    raise
 
 # Ensure folders exist with proper permissions
 try:
@@ -115,28 +97,12 @@ except Exception as e:
     OUTPUT_FOLDER = tempfile.mkdtemp()
     app.logger.info(f"Using temporary folders: {UPLOAD_FOLDER}, {OUTPUT_FOLDER}")
 
-# S3 client setup
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-)
+# Update FFmpeg path for Render.com
+FFMPEG_PATH = os.getenv('FFMPEG_PATH', '/usr/bin/ffmpeg')
 
-def upload_to_s3(file_path, bucket, s3_path):
-    try:
-        s3_client.upload_file(file_path, bucket, s3_path)
-        return True
-    except ClientError as e:
-        app.logger.error(f"S3 upload error: {e}")
-        return False
-
-def download_from_s3(bucket, s3_path, local_path):
-    try:
-        s3_client.download_file(bucket, s3_path, local_path)
-        return True
-    except ClientError as e:
-        app.logger.error(f"S3 download error: {e}")
-        return False
+# Initialize job tracking
+job_status = {}
+job_folders = {}
 
 @app.route('/')
 def index():
