@@ -7,14 +7,22 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.0
+      - key: FLASK_ENV
+        value: production
       - key: REDIS_URL
         fromService:
           type: redis
           name: redis-server
           property: connectionString
+      - key: UPLOAD_FOLDER
+        value: /tmp/uploads
+      - key: OUTPUT_FOLDER
+        value: /tmp/outputs
+      - key: FFMPEG_PATH
+        value: /usr/bin/ffmpeg
     plan: free
 
   - type: redis
     name: redis-server
-    ipAllowList: [] # optional (accepts all)
-    plan: free
+    ipAllowList: []
+    plan: free 
