@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: image-video-modifier
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn webappimagevidmodifier:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.0
+    plan: free
+
+  - type: redis
+    name: redis-server
+    ipAllowList: []
+    plan: free 

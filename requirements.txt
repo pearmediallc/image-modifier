@@ -1,0 +1,9 @@
+Flask
+Pillow
+opencv-python
+numpy
+redis
+pillow-heif
+Werkzeug
+gunicorn
+boto3 
