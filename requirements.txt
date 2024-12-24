@@ -6,4 +6,3 @@ redis
 pillow-heif
 Werkzeug
 gunicorn
-boto3 
