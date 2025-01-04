@@ -21,7 +21,7 @@ from pillow_heif import register_heif_opener
 
 # Initialize Flask app first
 app = Flask(__name__)
-app.secret_key = 'f8cl2k98cj3i4fnckac3'
+app.secret_key = 'f8c43ghj7cj3i4tyusoh3'
 
 # Set up Flask logger
 if not app.debug:
