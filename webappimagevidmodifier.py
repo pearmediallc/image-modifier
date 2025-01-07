@@ -239,53 +239,87 @@ def get_progress(job_id):
 
 @app.route('/download/<job_id>', methods=['GET'])
 def download_files(job_id):
-    job_data = storage.hgetall(f"job:{job_id}")
-    if not job_data:
-        app.logger.error(f"[DOWNLOAD] Job ID {job_id} not found.")
-        return jsonify({"error": "Invalid job ID"}), 404
+    try:
+        # Check if job exists in storage
+        job_data = storage.hgetall(f"job:{job_id}")
+        if not job_data:
+            app.logger.error(f"[DOWNLOAD] Job ID {job_id} not found in storage.")
+            return jsonify({"error": "Invalid job ID"}), 404
 
-    session_output_folder = job_data.get("output_folder")
-    session_upload_folder = job_data.get("upload_folder")
+        # Get output folder path
+        session_output_folder = job_data.get("output_folder")
+        session_upload_folder = job_data.get("upload_folder")
 
-    if not session_output_folder or not os.path.exists(session_output_folder):
-        app.logger.error(f"[DOWNLOAD] Output folder for Job ID {job_id} does not exist.")
-        return jsonify({"error": "Output folder not found"}), 404
+        if not session_output_folder:
+            app.logger.error(f"[DOWNLOAD] Output folder path not found for Job ID {job_id}")
+            return jsonify({"error": "Output folder path not found"}), 404
 
-    processed_files = [
-        os.path.join(session_output_folder, f)
-        for f in os.listdir(session_output_folder)
-        if f.startswith("processed_")
-    ]
-    if not processed_files:
-        app.logger.error(f"[DOWNLOAD] No processed files found for Job ID {job_id}.")
-        return jsonify({"error": "Processed files not found"}), 404
-
-    zip_file_path = os.path.join(session_output_folder, f"processed_files_{job_id}.zip")
-    if not os.path.exists(zip_file_path):
-        with zipfile.ZipFile(zip_file_path, 'w') as zipf:
-            for file in processed_files:
-                zipf.write(file, os.path.basename(file))
-
-    @after_this_request
-    def remove_files(response):
-        """Delete uploaded and output files after the ZIP file is sent."""
+        # Create output folder if it doesn't exist
         try:
-            # Remove output folder
-            if session_output_folder and os.path.exists(session_output_folder):
-                shutil.rmtree(session_output_folder)
-                app.logger.info(f"Cleaned up output folder for job {job_id}")
-
-            # Remove upload folder
-            if session_upload_folder and os.path.exists(session_upload_folder):
-                shutil.rmtree(session_upload_folder)
-                app.logger.info(f"Cleaned up upload folder for job {job_id}")
+            os.makedirs(session_output_folder, exist_ok=True)
         except Exception as e:
-            app.logger.error(f"Failed to clean up files for job {job_id}: {e}")
-        return response
+            app.logger.error(f"[DOWNLOAD] Failed to create output folder for Job ID {job_id}: {str(e)}")
+            return jsonify({"error": "Failed to create output folder"}), 500
 
-    return send_file(zip_file_path, as_attachment=True)
+        # Check if the folder exists after creation attempt
+        if not os.path.exists(session_output_folder):
+            app.logger.error(f"[DOWNLOAD] Output folder creation failed for Job ID {job_id}")
+            return jsonify({"error": "Failed to access output folder"}), 500
 
+        # Get processed files
+        try:
+            processed_files = [
+                os.path.join(session_output_folder, f)
+                for f in os.listdir(session_output_folder)
+                if f.startswith("processed_")
+            ]
+        except Exception as e:
+            app.logger.error(f"[DOWNLOAD] Failed to list processed files for Job ID {job_id}: {str(e)}")
+            return jsonify({"error": "Failed to access processed files"}), 500
 
+        if not processed_files:
+            app.logger.error(f"[DOWNLOAD] No processed files found for Job ID {job_id}")
+            return jsonify({"error": "No processed files found"}), 404
+
+        # Create zip file
+        zip_file_path = os.path.join(session_output_folder, f"processed_files_{job_id}.zip")
+        try:
+            if not os.path.exists(zip_file_path):
+                with zipfile.ZipFile(zip_file_path, 'w') as zipf:
+                    for file in processed_files:
+                        if os.path.exists(file):  # Extra check to ensure file exists
+                            zipf.write(file, os.path.basename(file))
+        except Exception as e:
+            app.logger.error(f"[DOWNLOAD] Failed to create zip file for Job ID {job_id}: {str(e)}")
+            return jsonify({"error": "Failed to create zip file"}), 500
+
+        if not os.path.exists(zip_file_path):
+            app.logger.error(f"[DOWNLOAD] Zip file creation failed for Job ID {job_id}")
+            return jsonify({"error": "Failed to create download file"}), 500
+
+        @after_this_request
+        def remove_files(response):
+            """Delete uploaded and output files after the ZIP file is sent."""
+            def delayed_cleanup():
+                time.sleep(5)  # Wait 5 seconds before cleanup
+                try:
+                    if session_output_folder and os.path.exists(session_output_folder):
+                        shutil.rmtree(session_output_folder)
+                        app.logger.info(f"Cleaned up output folder for job {job_id}")
+                    if session_upload_folder and os.path.exists(session_upload_folder):
+                        shutil.rmtree(session_upload_folder)
+                        app.logger.info(f"Cleaned up upload folder for job {job_id}")
+                except Exception as e:
+                    app.logger.error(f"Failed to clean up files for job {job_id}: {e}")
+
+            threading.Thread(target=delayed_cleanup, daemon=True).start()
+            return response
+
+        return send_file(zip_file_path, as_attachment=True)
+
+    except Exception as e:
+        app.logger.error(f"[DOWNLOAD] Unexpected error for Job ID {job_id}: {str(e)}")
+        return jsonify({"error": "Download failed"}), 500
 
 
 def safe_remove(file_path):
