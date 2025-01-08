@@ -378,81 +378,64 @@ def modify_image(input_path, output_path, job_id, variation):
 # Function to modify videos
 def modify_video(input_path, output_path, job_id, variation):
     try:
-        # Unique temporary paths for audio and video processing
         temp_audio_path = os.path.join(OUTPUT_FOLDER, f"{job_id}_{variation}_{os.path.basename(input_path)}_temp_audio.mp3")
         temp_video_path = os.path.join(OUTPUT_FOLDER, f"{job_id}_{variation}_{os.path.basename(input_path)}_temp_video.mp4")
 
         storage.hset(f"job:{job_id}", "status", "processing")
 
-        # Extract audio
+        # More efficient audio extraction
         audio_extraction_command = [
-            FFMPEG_PATH, "-i", input_path, "-q:a", "0", "-map", "a", temp_audio_path
+            FFMPEG_PATH, 
+            "-i", input_path,
+            "-vn",  # Skip video processing
+            "-acodec", "mp3",
+            "-ar", "44100",  # Standard audio rate
+            "-ac", "2",      # Stereo
+            "-b:a", "128k",  # Lower bitrate for audio
+            temp_audio_path
         ]
-        subprocess.run(audio_extraction_command, check=True, capture_output=True, text=True, timeout=3000)
+        subprocess.run(audio_extraction_command, check=True, capture_output=True, text=True)
 
-        # Process video frames
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            raise Exception(f"Could not open video file: {input_path}")
-
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        # Adjust FPS randomly by ±5% for each variation
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
-        random.seed(variation)  # Ensure consistent randomness per variation
-        adjusted_fps = original_fps * random.uniform(0.95, 1.05)
-
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(temp_video_path, fourcc, adjusted_fps, (width, height))
-
-        if not out.isOpened():
-            raise Exception(f"Failed to initialize VideoWriter for: {output_path}")
-
-        # Uniform brightness adjustment
-        adjustment = random.uniform(-0.05, 0.05)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        processed_frames = 0
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # Modify the frame
-            frame = frame.astype(np.float32)
-            frame = np.clip(frame * (1 + adjustment), 0, 255).astype(np.uint8)
-
-            # Add invisible mesh overlay
-            frame_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frame_image = add_invisible_mesh(frame_image)
-
-            # Convert back and write to output
-            frame = cv2.cvtColor(np.array(frame_image), cv2.COLOR_RGB2BGR)
-            out.write(frame)
-
-            processed_frames += 1
-
-            # Update progress periodically
-            if total_frames > 0:
-                progress = int((processed_frames / total_frames) * 100)
-                storage.hset(f"job:{job_id}", "progress", progress)
-
-        cap.release()
-        out.release()
-
-        # Combine audio and video with randomized speed adjustment
-        speed_factor = random.uniform(0.95, 1.05)  # ±5% speed adjustment
+        # Process video with lower memory usage
         combine_command = [
-            FFMPEG_PATH, "-i", temp_video_path, "-i", temp_audio_path,
-            "-filter:v", f"setpts={1/speed_factor}*PTS", "-c:a", "aac", output_path
+            FFMPEG_PATH,
+            # Input files
+            "-i", input_path,
+            "-i", temp_audio_path,
+            # Limit resources
+            "-threads", "2",             # Use fewer CPU threads
+            "-memory_limit", "512M",     # Limit memory usage
+            # Optimize encoding
+            "-preset", "ultrafast",      # Fastest encoding
+            "-tune", "fastdecode",       # Optimize for decoding speed
+            # Lower quality but faster processing
+            "-b:v", "1M",               # Lower video bitrate
+            "-maxrate", "1M",           # Maximum bitrate
+            "-bufsize", "2M",           # Buffer size
+            # Speed adjustment
+            "-filter:v", f"setpts={1/speed_factor}*PTS",
+            # Audio settings
+            "-c:a", "aac",
+            "-b:a", "128k",             # Lower audio bitrate
+            # Output
+            "-y",                       # Overwrite output file
+            output_path
         ]
-        subprocess.run(combine_command, check=True, capture_output=True, text=True, timeout=3000)
 
+        # Run FFmpeg with timeout
+        subprocess.run(combine_command, check=True, capture_output=True, text=True, timeout=1800)
+
+    except subprocess.TimeoutExpired:
+        app.logger.error(f"FFmpeg process timed out for job {job_id}")
+        raise
+    except subprocess.CalledProcessError as e:
+        app.logger.error(f"FFmpeg process failed for job {job_id}: {e.stderr}")
+        raise
     except Exception as e:
-        app.logger.error(f"Error in video processing for job {job_id}, variation {variation}: {e}")
+        app.logger.error(f"Error in video processing for job {job_id}: {str(e)}")
+        raise
     finally:
-        # Cleanup and progress update
+        # Cleanup temp files
         safe_remove(temp_audio_path)
         safe_remove(temp_video_path)
         storage.hincrby(f"job:{job_id}", "completed_files", 1)
